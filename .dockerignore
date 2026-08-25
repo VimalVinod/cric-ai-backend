@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+test_data/
+api_uploads/
+api_results/
+api_reports/
