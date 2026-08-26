@@ -2388,12 +2388,8 @@ def analyze_video(
     print("=" * 60)
 
     print()
-    print(
-        f"Technical score : "
-        f"{technical_score "
-        if technical_score is not None :
-        else '--'}
-    )
+       score_display = f"{technical_score}" if technical_score is not None else "--"
+    print(f"Technical score : {score_display}")
 
     print(
         f"Release frame   : "
