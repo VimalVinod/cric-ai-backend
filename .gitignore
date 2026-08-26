@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+venv/
+api_uploads/*
+api_results/*
+api_annotated/*
+api_reports/*
+.DS_Store
