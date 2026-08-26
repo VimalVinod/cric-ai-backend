@@ -2391,7 +2391,7 @@ def analyze_video(
     print(
         f"Technical score : "
         f"{technical_score "
-        if technical_score is not None "
+        if technical_score is not None :
         else '--'}"
     )
 
