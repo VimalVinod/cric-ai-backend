@@ -154,6 +154,17 @@ async def analyze_video(
     """
 
     # ========================================================
+    # DEBUG LOG - REQUEST RECEIVED
+    # ========================================================
+
+    print("=" * 60, flush=True)
+    print("ANALYZE REQUEST RECEIVED", flush=True)
+    print(f"Filename: {file.filename}", flush=True)
+    print(f"Arm: {arm}", flush=True)
+    print("=" * 60, flush=True)
+
+
+    # ========================================================
     # Validate arm
     # ========================================================
 
@@ -242,10 +253,26 @@ async def analyze_video(
 
     except Exception as error:
 
+        print(
+            f"ERROR SAVING VIDEO: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
             status_code=500,
             detail=f"Unable to save uploaded video: {error}",
         )
+
+
+    # ========================================================
+    # DEBUG LOG - VIDEO SAVED
+    # ========================================================
+
+    print(
+        f"VIDEO SAVED: {video_path} | "
+        f"SIZE: {video_path.stat().st_size} bytes",
+        flush=True,
+    )
 
 
     # ========================================================
@@ -269,6 +296,16 @@ async def analyze_video(
     ]
 
 
+    # ========================================================
+    # DEBUG LOG - START PHASE 1
+    # ========================================================
+
+    print("=" * 60, flush=True)
+    print("STARTING PHASE 1", flush=True)
+    print(f"Command: {' '.join(phase1_command)}", flush=True)
+    print("=" * 60, flush=True)
+
+
     try:
 
         process = subprocess.run(
@@ -280,10 +317,45 @@ async def analyze_video(
 
     except Exception as error:
 
+        print(
+            f"ERROR STARTING PHASE 1: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
             status_code=500,
             detail=f"Unable to start Phase 1: {error}",
         )
+
+
+    # ========================================================
+    # DEBUG LOG - PHASE 1 FINISHED
+    # ========================================================
+
+    print(
+        "=" * 60,
+        flush=True,
+    )
+
+    print(
+        f"PHASE 1 FINISHED: RETURN CODE {process.returncode}",
+        flush=True,
+    )
+
+    print(
+        f"PHASE 1 STDOUT LENGTH: {len(process.stdout)}",
+        flush=True,
+    )
+
+    print(
+        f"PHASE 1 STDERR LENGTH: {len(process.stderr)}",
+        flush=True,
+    )
+
+    print(
+        "=" * 60,
+        flush=True,
+    )
 
 
     # ========================================================
@@ -292,11 +364,11 @@ async def analyze_video(
 
     if process.returncode != 0:
 
-        print("PHASE 1 STDOUT")
-        print(process.stdout)
+        print("PHASE 1 STDOUT", flush=True)
+        print(process.stdout, flush=True)
 
-        print("PHASE 1 STDERR")
-        print(process.stderr)
+        print("PHASE 1 STDERR", flush=True)
+        print(process.stderr, flush=True)
 
         raise HTTPException(
             status_code=500,
@@ -314,6 +386,11 @@ async def analyze_video(
 
     if not json_path.exists():
 
+        print(
+            "PHASE 1 FINISHED BUT JSON WAS NOT GENERATED",
+            flush=True,
+        )
+
         raise HTTPException(
             status_code=500,
             detail=(
@@ -321,6 +398,12 @@ async def analyze_video(
                 "no JSON result was generated."
             ),
         )
+
+
+    print(
+        f"PHASE 1 JSON CREATED: {json_path}",
+        flush=True,
+    )
 
 
     # ========================================================
@@ -339,19 +422,30 @@ async def analyze_video(
 
     except Exception as error:
 
+        print(
+            f"ERROR READING PHASE 1 JSON: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
             status_code=500,
             detail=f"Unable to read Phase 1 JSON: {error}",
         )
 
 
+    print(
+        "PHASE 1 JSON READ SUCCESSFULLY",
+        flush=True,
+    )
+
+
     # ========================================================
     # ANNOTATED VIDEO
     # ========================================================
 
-    print("=" * 60)
-    print("GENERATING ANNOTATED VIDEO")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("STARTING ANNOTATED VIDEO GENERATION", flush=True)
+    print("=" * 60, flush=True)
 
     annotate_command = [
         sys.executable,
@@ -370,6 +464,12 @@ async def analyze_video(
     ]
 
 
+    print(
+        f"Annotation command: {' '.join(annotate_command)}",
+        flush=True,
+    )
+
+
     try:
 
         annotation_process = subprocess.run(
@@ -381,10 +481,42 @@ async def analyze_video(
 
     except Exception as error:
 
+        print(
+            f"ERROR STARTING ANNOTATION: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
             status_code=500,
             detail=f"Unable to start video annotation: {error}",
         )
+
+
+    # ========================================================
+    # DEBUG LOG - ANNOTATION FINISHED
+    # ========================================================
+
+    print("=" * 60, flush=True)
+
+    print(
+        f"ANNOTATION FINISHED: RETURN CODE "
+        f"{annotation_process.returncode}",
+        flush=True,
+    )
+
+    print(
+        f"ANNOTATION STDOUT LENGTH: "
+        f"{len(annotation_process.stdout)}",
+        flush=True,
+    )
+
+    print(
+        f"ANNOTATION STDERR LENGTH: "
+        f"{len(annotation_process.stderr)}",
+        flush=True,
+    )
+
+    print("=" * 60, flush=True)
 
 
     # ========================================================
@@ -393,11 +525,25 @@ async def analyze_video(
 
     if annotation_process.returncode != 0:
 
-        print("ANNOTATION STDOUT")
-        print(annotation_process.stdout)
+        print(
+            "ANNOTATION STDOUT",
+            flush=True,
+        )
 
-        print("ANNOTATION STDERR")
-        print(annotation_process.stderr)
+        print(
+            annotation_process.stdout,
+            flush=True,
+        )
+
+        print(
+            "ANNOTATION STDERR",
+            flush=True,
+        )
+
+        print(
+            annotation_process.stderr,
+            flush=True,
+        )
 
         raise HTTPException(
             status_code=500,
@@ -415,6 +561,11 @@ async def analyze_video(
 
     if not annotated_path.exists():
 
+        print(
+            "ANNOTATION FINISHED BUT VIDEO WAS NOT GENERATED",
+            flush=True,
+        )
+
         raise HTTPException(
             status_code=500,
             detail=(
@@ -425,7 +576,14 @@ async def analyze_video(
 
 
     print(
-        f"Annotated video created: {annotated_path}"
+        f"ANNOTATED VIDEO CREATED: {annotated_path}",
+        flush=True,
+    )
+
+    print(
+        f"ANNOTATED VIDEO SIZE: "
+        f"{annotated_path.stat().st_size} bytes",
+        flush=True,
     )
 
 
@@ -458,6 +616,11 @@ async def analyze_video(
     # ========================================================
     # FINAL RESPONSE
     # ========================================================
+
+    print("=" * 60, flush=True)
+    print("ANALYSIS COMPLETED SUCCESSFULLY", flush=True)
+    print(f"Analysis ID: {analysis_id}", flush=True)
+    print("=" * 60, flush=True)
 
     return {
 
