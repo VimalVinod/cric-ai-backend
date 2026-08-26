@@ -1,127 +1,119 @@
+
 """
 phase1_engine.py
 ============================================================
 
-BOWLING BIOMECHANICS ANALYSIS SYSTEM
-PHASE 1 - AI ENGINE
+CRIC AI - BOWLING BIOMECHANICS ANALYSIS
+PHASE 1 - RENDER LIGHTWEIGHT ENGINE
 
-Render Free / Low-Memory / Robust Version
-
-Pipeline:
-    Video
-      -> YOLO Pose Detection
-      -> Bowler Selection
-      -> Temporal Bowling-Arm Tracking
-      -> Release Detection
-      -> Delivery Window
-      -> Biomechanical Measurements
-      -> Reliability
-      -> Technical Scores
-      -> Risk Indicators
-      -> Recommendations
-      -> JSON Report
+Render Free / CPU / Low-Memory Architecture
 
 IMPORTANT:
-This system provides biomechanical risk indicators.
-It is NOT a medical diagnosis and does not predict injury with certainty.
+This is a biomechanical screening system.
+It is NOT a medical diagnosis and does not predict injury
+with certainty.
+
+NEW LIGHTWEIGHT FLOW
+--------------------
+
+Video
+  |
+  +--> Read metadata
+  |
+  +--> Select limited key frames
+  |
+  +--> Resize frames
+  |
+  +--> YOLOv8n-Pose
+  |
+  +--> Extract body keypoints
+  |
+  +--> Estimate delivery/release
+  |
+  +--> Biomechanical measurements
+  |
+  +--> Reliability
+  |
+  +--> Technical score
+  |
+  +--> Risk indicators
+  |
+  +--> Recommendations
+  |
+  +--> JSON report
+
+DESIGN GOALS
+------------
+
+1. Very small CPU workload
+2. Very low RAM usage
+3. Fixed maximum inference count
+4. No full-video pose tracking
+5. No large frame history
+6. Compatible with Render Free
+7. Preserve existing API JSON structure
+
 """
 
-# ============================================================
-# STANDARD LIBRARY
-# ============================================================
-
 import argparse
-import gc
 import json
 import math
 import os
-import sys
-import traceback
+import gc
+
 from statistics import median
-
-
-# ============================================================
-# ENVIRONMENT / TORCH CONFIGURATION
-# IMPORTANT:
-# Set environment variables BEFORE importing torch.
-# ============================================================
-
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
 import torch
 
-
 # ============================================================
-# TORCH CPU CONFIGURATION
+# CPU / MEMORY CONFIGURATION
 # ============================================================
 
-try:
-    torch.set_num_threads(1)
-except Exception as error:
-    print(
-        f"[WARNING] Could not set torch threads: {error}",
-        flush=True
-    )
-
-# Do NOT call set_num_interop_threads() here.
-# It can fail when another Torch operation has already started.
-
-
-# ============================================================
-# ULTRALYTICS
-# ============================================================
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 from ultralytics import YOLO
 
 
 # ============================================================
-# CONFIGURATION
+# VERSION
 # ============================================================
 
-VERSION = "PHASE-1-RENDER-ROBUST-V2"
+VERSION = "PHASE-1-RENDER-LITE-V2"
 
+
+# ============================================================
+# RENDER LIMITS
+# ============================================================
+
+# Very small YOLO input.
+YOLO_IMAGE_SIZE = 256
+
+# Maximum frame dimension before YOLO.
+MAX_FRAME_DIMENSION = 384
+
+# HARD LIMIT.
+# No matter how long the video is, we never run more than
+# this many YOLO inferences.
+MAX_INFERENCES = 20
+
+# Minimum confidence.
 MIN_CONF = 0.25
 POSE_CONF = 0.30
 
-# Smaller YOLO input reduces CPU/RAM requirements.
-YOLO_IMAGE_SIZE = 416
+# Number of frames around estimated release used for
+# biomechanical aggregation.
+MEASUREMENT_WINDOW = 3
 
-# Maximum frame dimension before YOLO.
-MAX_FRAME_DIMENSION = 640
-
-# Process every Nth original video frame.
-# 2 = every second frame.
-FRAME_SKIP = 2
-
-# Maximum number of frames that Phase 1 will process.
-# None = no artificial limit.
-#
-# This protects Render Free from accidentally huge uploads.
-MAX_ANALYSIS_FRAMES = 900
-
-# Delivery window around release.
-WINDOW_BEFORE = 5
-WINDOW_AFTER = 5
-
-# Temporal tracking.
-MAX_WRIST_JUMP = 160.0
-MAX_ELBOW_JUMP = 120.0
-MAX_MISSING_FRAMES = 8
-
-# Release detection.
-RELEASE_MIN_SPEED = 5.0
-
-# Minimum useful processed frames.
-MIN_ANALYSIS_FRAMES = 5
+# Minimum number of valid samples required for a useful
+# release estimation.
+MIN_VALID_SAMPLES = 4
 
 
 # ============================================================
-# COCO KEYPOINT NAMES
+# COCO KEYPOINTS
 # ============================================================
 
 KEYPOINT_NAMES = [
@@ -146,22 +138,14 @@ KEYPOINT_NAMES = [
 
 
 # ============================================================
-# BASIC HELPERS
+# HELPERS
 # ============================================================
-
-def log(message=""):
-    """
-    Flush console output immediately.
-
-    Important for Render logs.
-    """
-    print(message, flush=True)
-
 
 def safe_float(value):
     """
-    Convert numpy/scalar values to normal Python floats.
+    Convert a numeric value to a normal JSON-safe float.
     """
+
     if value is None:
         return None
 
@@ -179,7 +163,7 @@ def safe_float(value):
 
 def point_from_dict(points, name, min_conf=MIN_CONF):
     """
-    Return numpy [x, y] if keypoint exists and confidence is sufficient.
+    Return numpy [x, y] when the keypoint is reliable.
     """
 
     if not points:
@@ -191,22 +175,16 @@ def point_from_dict(points, name, min_conf=MIN_CONF):
         return None
 
     try:
-        x, y, conf = value
-
-        x = float(x)
-        y = float(y)
-        conf = float(conf)
-
+        x = float(value[0])
+        y = float(value[1])
+        confidence = float(value[2])
     except Exception:
         return None
 
-    if conf < min_conf:
+    if confidence < min_conf:
         return None
 
-    return np.array(
-        [x, y],
-        dtype=float
-    )
+    return np.array([x, y], dtype=float)
 
 
 def distance(a, b):
@@ -217,17 +195,13 @@ def distance(a, b):
     if a is None or b is None:
         return None
 
-    try:
-        return float(
-            np.linalg.norm(
-                np.array(a, dtype=float)
-                -
-                np.array(b, dtype=float)
-            )
+    return float(
+        np.linalg.norm(
+            np.asarray(a, dtype=float)
+            -
+            np.asarray(b, dtype=float)
         )
-
-    except Exception:
-        return None
+    )
 
 
 def angle_3pt(a, b, c):
@@ -238,106 +212,102 @@ def angle_3pt(a, b, c):
     if a is None or b is None or c is None:
         return None
 
-    try:
-        ba = (
-            np.array(a, dtype=float)
-            -
-            np.array(b, dtype=float)
-        )
+    ba = (
+        np.asarray(a, dtype=float)
+        -
+        np.asarray(b, dtype=float)
+    )
 
-        bc = (
-            np.array(c, dtype=float)
-            -
-            np.array(b, dtype=float)
-        )
+    bc = (
+        np.asarray(c, dtype=float)
+        -
+        np.asarray(b, dtype=float)
+    )
 
-        denom = (
-            np.linalg.norm(ba)
-            *
-            np.linalg.norm(bc)
-        )
+    denominator = (
+        np.linalg.norm(ba)
+        *
+        np.linalg.norm(bc)
+    )
 
-        if denom <= 1e-8:
-            return None
-
-        cosine = (
-            np.dot(ba, bc)
-            /
-            denom
-        )
-
-        cosine = np.clip(
-            cosine,
-            -1.0,
-            1.0
-        )
-
-        return float(
-            np.degrees(
-                np.arccos(cosine)
-            )
-        )
-
-    except Exception:
+    if denominator <= 1e-8:
         return None
+
+    cosine = (
+        np.dot(ba, bc)
+        /
+        denominator
+    )
+
+    cosine = np.clip(
+        cosine,
+        -1.0,
+        1.0
+    )
+
+    return float(
+        np.degrees(
+            np.arccos(cosine)
+        )
+    )
 
 
 def line_angle_from_vertical(p1, p2):
     """
     Angle of p1 -> p2 relative to vertical.
 
-    0 degrees = vertical.
-    Larger values = greater forward/backward inclination.
+    0 = vertical
+    Larger = more inclination
     """
 
     if p1 is None or p2 is None:
         return None
 
-    try:
-        vector = (
-            np.array(p2, dtype=float)
-            -
-            np.array(p1, dtype=float)
-        )
+    vector = (
+        np.asarray(p2, dtype=float)
+        -
+        np.asarray(p1, dtype=float)
+    )
 
-        length = np.linalg.norm(vector)
+    length = np.linalg.norm(vector)
 
-        if length <= 1e-8:
-            return None
-
-        vertical = np.array(
-            [0.0, -1.0]
-        )
-
-        cosine = (
-            np.dot(vector, vertical)
-            /
-            length
-        )
-
-        cosine = np.clip(
-            cosine,
-            -1.0,
-            1.0
-        )
-
-        return float(
-            np.degrees(
-                np.arccos(cosine)
-            )
-        )
-
-    except Exception:
+    if length <= 1e-8:
         return None
+
+    vertical = np.array(
+        [0.0, -1.0],
+        dtype=float
+    )
+
+    cosine = (
+        np.dot(vector, vertical)
+        /
+        length
+    )
+
+    cosine = np.clip(
+        cosine,
+        -1.0,
+        1.0
+    )
+
+    return float(
+        np.degrees(
+            np.arccos(cosine)
+        )
+    )
 
 
 # ============================================================
-# FRAME RESIZING
+# FRAME RESIZE
 # ============================================================
 
 def resize_for_inference(frame):
     """
-    Resize large video frames before YOLO inference.
+    Resize frame aggressively before YOLO.
+
+    This prevents 1080p / 4K frames from consuming large
+    amounts of memory.
     """
 
     if frame is None:
@@ -345,18 +315,18 @@ def resize_for_inference(frame):
 
     height, width = frame.shape[:2]
 
-    largest_dimension = max(
+    largest = max(
         height,
         width
     )
 
-    if largest_dimension <= MAX_FRAME_DIMENSION:
+    if largest <= MAX_FRAME_DIMENSION:
         return frame
 
     scale = (
         MAX_FRAME_DIMENSION
         /
-        largest_dimension
+        largest
     )
 
     new_width = max(
@@ -371,12 +341,47 @@ def resize_for_inference(frame):
 
     return cv2.resize(
         frame,
-        (
-            new_width,
-            new_height
-        ),
+        (new_width, new_height),
         interpolation=cv2.INTER_AREA
     )
+
+
+# ============================================================
+# FRAME SELECTION
+# ============================================================
+
+def select_frame_indices(total_frames):
+    """
+    Select a small number of evenly distributed frames.
+
+    IMPORTANT:
+    We intentionally do NOT process the entire video.
+
+    This is the main Render optimization.
+    """
+
+    if total_frames <= 0:
+        return []
+
+    if total_frames <= MAX_INFERENCES:
+        return list(range(total_frames))
+
+    indices = np.linspace(
+        0,
+        total_frames - 1,
+        MAX_INFERENCES,
+        dtype=int
+    )
+
+    # Remove duplicates.
+    indices = sorted(
+        set(
+            int(x)
+            for x in indices
+        )
+    )
+
+    return indices
 
 
 # ============================================================
@@ -384,80 +389,43 @@ def resize_for_inference(frame):
 # ============================================================
 
 class PoseDetector:
+    """
+    Minimal YOLO pose detector.
+
+    Only one model instance is loaded.
+    """
 
     def __init__(self, model_path):
 
-        log()
-        log("=" * 60)
-        log("INITIALIZING YOLO POSE DETECTOR")
-        log("=" * 60)
-
-        log(
-            f"Model path : {model_path}"
+        print()
+        print("Loading lightweight YOLO pose model...")
+        print(
+            f"YOLO size       : {YOLO_IMAGE_SIZE}"
+        )
+        print(
+            f"Max frame size  : {MAX_FRAME_DIMENSION}"
+        )
+        print(
+            f"Max inferences  : {MAX_INFERENCES}"
         )
 
-        log(
-            f"YOLO size  : {YOLO_IMAGE_SIZE}"
+        self.model = YOLO(
+            model_path
         )
 
-        log(
-            f"YOLO conf  : {POSE_CONF}"
-        )
-
-        log(
-            f"Device     : CPU"
-        )
-
-        if not os.path.isfile(model_path):
-
-            raise FileNotFoundError(
-                f"YOLO model not found: {model_path}"
-            )
-
-        try:
-
-            log("Loading YOLO model...")
-
-            self.model = YOLO(
-                model_path
-            )
-
-            log("YOLO model loaded successfully.")
-
-        except Exception as error:
-
-            log()
-            log("[ERROR] YOLO model loading failed.")
-            log(
-                f"[ERROR] {type(error).__name__}: {error}"
-            )
-
-            raise
+        print("YOLO model loaded.")
 
     def detect(self, frame):
-        """
-        Detect strongest person in frame.
 
-        Returns:
-            {
-                "nose": (x, y, confidence),
-                ...
-            }
-
-        or None.
-        """
+        if frame is None:
+            return None
 
         results = None
-        result = None
-        data = None
 
         try:
 
-            if frame is None:
-                return None
-
-            results = self.model.predict(
-                source=frame,
+            results = self.model(
+                frame,
                 verbose=False,
                 conf=POSE_CONF,
                 imgsz=YOLO_IMAGE_SIZE,
@@ -474,12 +442,6 @@ class PoseDetector:
             if result.keypoints is None:
                 return None
 
-            if result.keypoints.data is None:
-                return None
-
-            if len(result.keypoints.data) == 0:
-                return None
-
             data = (
                 result
                 .keypoints
@@ -491,61 +453,16 @@ class PoseDetector:
             if data.ndim != 3:
                 return None
 
-            if data.shape[1] < len(KEYPOINT_NAMES):
+            if len(data) == 0:
                 return None
 
-            # ------------------------------------------------
-            # Select strongest person.
-            # max_det=1 normally means one person.
-            # ------------------------------------------------
+            # Because max_det=1 this is normally one person.
+            person = data[0]
 
-            candidate_scores = []
-
-            for person in data:
-
-                confidences = person[:, 2]
-
-                visible = (
-                    confidences >= MIN_CONF
-                )
-
-                if np.sum(visible) == 0:
-
-                    candidate_scores.append(
-                        0.0
-                    )
-
-                else:
-
-                    candidate_scores.append(
-                        float(
-                            np.mean(
-                                confidences[
-                                    visible
-                                ]
-                            )
-                        )
-                    )
-
-            if not candidate_scores:
-                return None
-
-            best_index = int(
-                np.argmax(
-                    candidate_scores
-                )
-            )
-
-            if (
-                candidate_scores[best_index]
-                <
-                POSE_CONF
+            if len(person) != len(
+                KEYPOINT_NAMES
             ):
                 return None
-
-            person = data[
-                best_index
-            ]
 
             points = {}
 
@@ -561,343 +478,53 @@ class PoseDetector:
                     person[index][1]
                 )
 
-                conf = float(
+                confidence = float(
                     person[index][2]
                 )
 
                 points[name] = (
                     x,
                     y,
-                    conf
+                    confidence
                 )
+
+            # Require some important body points.
+            important = [
+                "left_shoulder",
+                "right_shoulder",
+                "left_hip",
+                "right_hip",
+            ]
+
+            visible = sum(
+                1
+                for name in important
+                if (
+                    points.get(name) is not None
+                    and
+                    points[name][2] >= MIN_CONF
+                )
+            )
+
+            if visible < 2:
+                return None
 
             return points
 
         except Exception as error:
 
-            # Do not crash the entire video because
-            # one individual frame failed.
-            log(
-                f"[WARNING] YOLO frame inference failed: "
-                f"{type(error).__name__}: {error}"
+            print(
+                f"YOLO frame error: {error}"
             )
 
             return None
 
         finally:
 
-            results = None
-            result = None
-            data = None
+            del results
 
-
-# ============================================================
-# TEMPORAL BOWLING ARM TRACKER
-# ============================================================
-
-class BowlingArmTracker:
-    """
-    Stabilizes elbow/wrist positions across frames.
-    """
-
-    def __init__(self, arm="right"):
-
-        self.arm = arm.lower()
-
-        if self.arm == "right":
-
-            self.elbow = "right_elbow"
-            self.wrist = "right_wrist"
-
-        else:
-
-            self.elbow = "left_elbow"
-            self.wrist = "left_wrist"
-
-        self.previous_elbow = None
-        self.previous_wrist = None
-
-        self.elbow_velocity = np.zeros(
-            2,
-            dtype=float
-        )
-
-        self.wrist_velocity = np.zeros(
-            2,
-            dtype=float
-        )
-
-        self.elbow_missing = 0
-        self.wrist_missing = 0
-
-    def extract(
-        self,
-        points,
-        name
-    ):
-
-        if not points:
-            return None
-
-        value = points.get(
-            name
-        )
-
-        if value is None:
-            return None
-
-        try:
-
-            x, y, conf = value
-
-            x = float(x)
-            y = float(y)
-            conf = float(conf)
-
-        except Exception:
-            return None
-
-        if conf < MIN_CONF:
-            return None
-
-        return np.array(
-            [x, y],
-            dtype=float
-        )
-
-    def predict(
-        self,
-        previous,
-        velocity
-    ):
-
-        if previous is None:
-            return None
-
-        return previous + velocity
-
-    def update_point(
-        self,
-        raw,
-        previous,
-        velocity,
-        missing,
-        max_jump
-    ):
-
-        # ----------------------------------------------------
-        # Missing point
-        # ----------------------------------------------------
-
-        if raw is None:
-
-            missing += 1
-
-            predicted = self.predict(
-                previous,
-                velocity
-            )
-
-            if (
-                missing
-                <=
-                MAX_MISSING_FRAMES
-            ):
-
-                return (
-                    predicted,
-                    velocity,
-                    missing
-                )
-
-            return (
-                None,
-                velocity,
-                missing
-            )
-
-        # ----------------------------------------------------
-        # First valid point
-        # ----------------------------------------------------
-
-        if previous is None:
-
-            return (
-                raw,
-                np.zeros(
-                    2,
-                    dtype=float
-                ),
-                0
-            )
-
-        # ----------------------------------------------------
-        # Jump detection
-        # ----------------------------------------------------
-
-        jump = np.linalg.norm(
-            raw - previous
-        )
-
-        if jump > max_jump:
-
-            missing += 1
-
-            predicted = self.predict(
-                previous,
-                velocity
-            )
-
-            if (
-                missing
-                <=
-                MAX_MISSING_FRAMES
-            ):
-
-                return (
-                    predicted,
-                    velocity,
-                    missing
-                )
-
-            return (
-                raw,
-                velocity,
-                0
-            )
-
-        # ----------------------------------------------------
-        # Temporal smoothing
-        # ----------------------------------------------------
-
-        alpha = 0.70
-
-        smoothed = (
-            alpha * raw
-            +
-            (1.0 - alpha)
-            * previous
-        )
-
-        new_velocity = (
-            0.70
-            *
-            (smoothed - previous)
-            +
-            0.30
-            *
-            velocity
-        )
-
-        return (
-            smoothed,
-            new_velocity,
-            0
-        )
-
-    def update(
-        self,
-        points
-    ):
-
-        if points is None:
-            return None
-
-        result = dict(
-            points
-        )
-
-        # ----------------------------------------------------
-        # Elbow
-        # ----------------------------------------------------
-
-        raw_elbow = self.extract(
-            points,
-            self.elbow
-        )
-
-        (
-            elbow,
-            self.elbow_velocity,
-            self.elbow_missing
-        ) = self.update_point(
-            raw_elbow,
-            self.previous_elbow,
-            self.elbow_velocity,
-            self.elbow_missing,
-            MAX_ELBOW_JUMP
-        )
-
-        if elbow is not None:
-
-            original = points.get(
-                self.elbow,
-                (0, 0, 0)
-            )
-
-            original_conf = float(
-                original[2]
-            )
-
-            result[
-                self.elbow
-            ] = (
-                float(elbow[0]),
-                float(elbow[1]),
-                max(
-                    original_conf,
-                    0.35
-                )
-            )
-
-            self.previous_elbow = elbow
-
-        # ----------------------------------------------------
-        # Wrist
-        # ----------------------------------------------------
-
-        raw_wrist = self.extract(
-            points,
-            self.wrist
-        )
-
-        (
-            wrist,
-            self.wrist_velocity,
-            self.wrist_missing
-        ) = self.update_point(
-            raw_wrist,
-            self.previous_wrist,
-            self.wrist_velocity,
-            self.wrist_missing,
-            MAX_WRIST_JUMP
-        )
-
-        if wrist is not None:
-
-            original = points.get(
-                self.wrist,
-                (0, 0, 0)
-            )
-
-            original_conf = float(
-                original[2]
-            )
-
-            result[
-                self.wrist
-            ] = (
-                float(wrist[0]),
-                float(wrist[1]),
-                max(
-                    original_conf,
-                    0.35
-                )
-            )
-
-            self.previous_wrist = wrist
-
-        return result
+            # Do not repeatedly call heavy garbage collection.
+            # Python handles temporary objects naturally.
 
 
 # ============================================================
@@ -905,72 +532,38 @@ class BowlingArmTracker:
 # ============================================================
 
 def torso_length(points):
-    """
-    Calculate torso length using midpoint between
-    shoulders and midpoint between hips.
-    """
 
-    if points is None:
+    if not points:
         return None
 
-    def point_xy(name):
-
-        point = points.get(
-            name
-        )
-
-        if point is None:
-            return None
-
-        if len(point) < 2:
-            return None
-
-        try:
-
-            x = float(point[0])
-            y = float(point[1])
-
-            confidence = (
-                float(point[2])
-                if len(point) >= 3
-                else 1.0
-            )
-
-        except Exception:
-            return None
-
-        if confidence < 0.20:
-            return None
-
-        return np.array(
-            [x, y],
-            dtype=float
-        )
-
-    left_shoulder = point_xy(
+    left_shoulder = point_from_dict(
+        points,
         "left_shoulder"
     )
 
-    right_shoulder = point_xy(
+    right_shoulder = point_from_dict(
+        points,
         "right_shoulder"
     )
 
-    left_hip = point_xy(
+    left_hip = point_from_dict(
+        points,
         "left_hip"
     )
 
-    right_hip = point_xy(
+    right_hip = point_from_dict(
+        points,
         "right_hip"
     )
 
     if any(
-        p is None
-        for p in (
+        x is None
+        for x in [
             left_shoulder,
             right_shoulder,
             left_hip,
             right_hip
-        )
+        ]
     ):
         return None
 
@@ -986,113 +579,90 @@ def torso_length(points):
         right_hip
     ) / 2.0
 
-    torso = np.linalg.norm(
-        shoulder_mid
-        -
+    value = distance(
+        shoulder_mid,
         hip_mid
     )
 
-    if torso <= 0:
+    if value is None or value <= 0:
         return None
 
-    return float(
-        torso
-    )
+    return value
 
 
 # ============================================================
-# RELEASE DETECTION
+# RELEASE ESTIMATION
 # ============================================================
 
-def calculate_wrist_speeds(
-    history,
-    arm
-):
+def wrist_position(points, arm):
 
-    wrist_name = (
+    name = (
         "right_wrist"
         if arm == "right"
         else "left_wrist"
     )
 
-    speeds = []
-
-    for i in range(
-        1,
-        len(history)
-    ):
-
-        previous = point_from_dict(
-            history[i - 1],
-            wrist_name
-        )
-
-        current = point_from_dict(
-            history[i],
-            wrist_name
-        )
-
-        if (
-            previous is None
-            or
-            current is None
-        ):
-
-            speeds.append(
-                None
-            )
-
-            continue
-
-        speed = distance(
-            previous,
-            current
-        )
-
-        speeds.append(
-            speed
-        )
-
-    return speeds
-
-
-def detect_release(
-    history,
-    arm
-):
-    """
-    Estimate release as the strongest wrist-motion point.
-
-    Returns index into PROCESSED history,
-    not original video frame number.
-    """
-
-    if len(history) < 5:
-        return None
-
-    speeds = calculate_wrist_speeds(
-        history,
-        arm
+    return point_from_dict(
+        points,
+        name
     )
 
-    valid = [
-        (index + 1, speed)
-        for index, speed in enumerate(
-            speeds
+
+def estimate_release(samples, arm):
+    """
+    Estimate release from wrist movement.
+
+    Because we use only a limited number of frames,
+    this is deliberately simple.
+
+    Returns:
+        sample index
+        or None
+    """
+
+    if len(samples) < MIN_VALID_SAMPLES:
+        return None
+
+    speeds = []
+
+    for i in range(1, len(samples)):
+
+        previous = wrist_position(
+            samples[i - 1]["points"],
+            arm
         )
+
+        current = wrist_position(
+            samples[i]["points"],
+            arm
+        )
+
+        if previous is None or current is None:
+
+            speeds.append(None)
+
+        else:
+
+            speeds.append(
+                distance(
+                    previous,
+                    current
+                )
+            )
+
+    valid = [
+        (i + 1, speed)
+        for i, speed in enumerate(speeds)
         if speed is not None
     ]
 
     if not valid:
         return None
 
+    # Ignore the very first part of the video.
     minimum_index = max(
-        2,
-        int(
-            len(history)
-            *
-            0.15
-        )
+        1,
+        int(len(samples) * 0.15)
     )
 
     valid = [
@@ -1104,54 +674,29 @@ def detect_release(
     if not valid:
         return None
 
-    # Avoid selecting an extremely late noisy spike.
-    maximum_allowed_index = max(
-        minimum_index,
-        int(
-            len(history)
-            *
-            0.95
-        )
-    )
-
-    valid = [
-        item
-        for item in valid
-        if item[0] <= maximum_allowed_index
-    ]
-
-    if not valid:
-        return None
-
     release_index, maximum_speed = max(
         valid,
-        key=lambda x: x[1]
+        key=lambda item: item[1]
     )
 
-    if (
-        maximum_speed
-        <
-        RELEASE_MIN_SPEED
-    ):
+    if maximum_speed is None:
         return None
 
-    return release_index
+    return int(
+        release_index
+    )
 
 
 # ============================================================
 # BIOMECHANICAL MEASUREMENTS
 # ============================================================
 
-def calculate_measurements(
-    points,
-    arm
-):
+def calculate_measurements(points, arm):
 
     if points is None:
         return {}
 
     def p(name):
-
         return point_from_dict(
             points,
             name
@@ -1209,17 +754,9 @@ def calculate_measurements(
 
     if arm == "right":
 
-        bowling_shoulder = (
-            right_shoulder
-        )
-
-        bowling_elbow = (
-            right_elbow
-        )
-
-        bowling_wrist = (
-            right_wrist
-        )
+        bowling_shoulder = right_shoulder
+        bowling_elbow = right_elbow
+        bowling_wrist = right_wrist
 
         front_hip = left_hip
         front_knee = left_knee
@@ -1231,17 +768,9 @@ def calculate_measurements(
 
     else:
 
-        bowling_shoulder = (
-            left_shoulder
-        )
-
-        bowling_elbow = (
-            left_elbow
-        )
-
-        bowling_wrist = (
-            left_wrist
-        )
+        bowling_shoulder = left_shoulder
+        bowling_elbow = left_elbow
+        bowling_wrist = left_wrist
 
         front_hip = right_hip
         front_knee = right_knee
@@ -1254,7 +783,7 @@ def calculate_measurements(
     measurements = {}
 
     # --------------------------------------------------------
-    # Midpoints
+    # BODY MIDPOINTS
     # --------------------------------------------------------
 
     mid_shoulder = None
@@ -1285,7 +814,7 @@ def calculate_measurements(
         ) / 2.0
 
     # --------------------------------------------------------
-    # Elbow angle
+    # ELBOW
     # --------------------------------------------------------
 
     measurements[
@@ -1297,7 +826,7 @@ def calculate_measurements(
     )
 
     # --------------------------------------------------------
-    # Front knee
+    # FRONT KNEE
     # --------------------------------------------------------
 
     measurements[
@@ -1309,7 +838,7 @@ def calculate_measurements(
     )
 
     # --------------------------------------------------------
-    # Back knee
+    # BACK KNEE
     # --------------------------------------------------------
 
     measurements[
@@ -1321,7 +850,7 @@ def calculate_measurements(
     )
 
     # --------------------------------------------------------
-    # Trunk forward flexion
+    # TRUNK FORWARD FLEXION
     # --------------------------------------------------------
 
     measurements[
@@ -1332,7 +861,7 @@ def calculate_measurements(
     )
 
     # --------------------------------------------------------
-    # Trunk lateral flexion
+    # TRUNK LATERAL FLEXION
     # --------------------------------------------------------
 
     if (
@@ -1346,11 +875,7 @@ def calculate_measurements(
             mid_hip
         )
 
-        if (
-            torso is not None
-            and
-            torso > 0
-        ):
+        if torso and torso > 0:
 
             horizontal_offset = abs(
                 mid_shoulder[0]
@@ -1370,10 +895,8 @@ def calculate_measurements(
             )
 
     # --------------------------------------------------------
-    # Shoulder line
+    # SHOULDER LINE
     # --------------------------------------------------------
-
-    shoulder_angle = None
 
     if (
         left_shoulder is not None
@@ -1387,7 +910,9 @@ def calculate_measurements(
             left_shoulder
         )
 
-        shoulder_angle = float(
+        measurements[
+            "shoulderLineAngle"
+        ] = float(
             np.degrees(
                 np.arctan2(
                     vector[1],
@@ -1396,15 +921,9 @@ def calculate_measurements(
             )
         )
 
-    measurements[
-        "shoulderLineAngle"
-    ] = shoulder_angle
-
     # --------------------------------------------------------
-    # Hip line
+    # HIP LINE
     # --------------------------------------------------------
-
-    hip_angle = None
 
     if (
         left_hip is not None
@@ -1418,7 +937,9 @@ def calculate_measurements(
             left_hip
         )
 
-        hip_angle = float(
+        measurements[
+            "hipLineAngle"
+        ] = float(
             np.degrees(
                 np.arctan2(
                     vector[1],
@@ -1427,13 +948,17 @@ def calculate_measurements(
             )
         )
 
-    measurements[
-        "hipLineAngle"
-    ] = hip_angle
+    # --------------------------------------------------------
+    # HIP / SHOULDER SEPARATION
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Hip / shoulder separation
-    # --------------------------------------------------------
+    shoulder_angle = measurements.get(
+        "shoulderLineAngle"
+    )
+
+    hip_angle = measurements.get(
+        "hipLineAngle"
+    )
 
     if (
         shoulder_angle is not None
@@ -1460,7 +985,7 @@ def calculate_measurements(
         )
 
     # --------------------------------------------------------
-    # Front foot offset
+    # FRONT FOOT OFFSET
     # --------------------------------------------------------
 
     if (
@@ -1474,11 +999,7 @@ def calculate_measurements(
             front_ankle
         )
 
-        if (
-            leg_length is not None
-            and
-            leg_length > 0
-        ):
+        if leg_length and leg_length > 0:
 
             measurements[
                 "frontFootOffset"
@@ -1493,7 +1014,7 @@ def calculate_measurements(
             )
 
     # --------------------------------------------------------
-    # Head offset
+    # HEAD OFFSET
     # --------------------------------------------------------
 
     if (
@@ -1502,15 +1023,11 @@ def calculate_measurements(
         mid_shoulder is not None
     ):
 
-        torso = torso_length(
+        scale = torso_length(
             points
         )
 
-        if (
-            torso is not None
-            and
-            torso > 0
-        ):
+        if scale and scale > 0:
 
             measurements[
                 "headOffset"
@@ -1520,35 +1037,32 @@ def calculate_measurements(
                     mid_shoulder
                 )
                 /
-                torso
+                scale
             )
 
     return {
         key: safe_float(value)
-        for key, value
-        in measurements.items()
+        for key, value in measurements.items()
     }
 
 
 # ============================================================
-# WINDOW AGGREGATION
+# AGGREGATION
 # ============================================================
 
 def aggregate_measurements(
-    window
+    measurement_list
 ):
 
-    if not window:
+    if not measurement_list:
         return {}
 
     keys = set()
 
-    for item in window:
-
-        if item:
-            keys.update(
-                item.keys()
-            )
+    for item in measurement_list:
+        keys.update(
+            item.keys()
+        )
 
     result = {}
 
@@ -1556,10 +1070,7 @@ def aggregate_measurements(
 
         values = []
 
-        for item in window:
-
-            if not item:
-                continue
+        for item in measurement_list:
 
             value = item.get(
                 key
@@ -1570,30 +1081,23 @@ def aggregate_measurements(
 
             try:
 
-                value = float(
-                    value
-                )
+                value = float(value)
 
-                if math.isfinite(
-                    value
-                ):
-
-                    values.append(
-                        value
-                    )
+                if math.isfinite(value):
+                    values.append(value)
 
             except Exception:
-                pass
+                continue
 
-        if not values:
+        if values:
+
+            result[key] = safe_float(
+                median(values)
+            )
+
+        else:
 
             result[key] = None
-
-            continue
-
-        result[key] = safe_float(
-            median(values)
-        )
 
     return result
 
@@ -1603,85 +1107,35 @@ def aggregate_measurements(
 # ============================================================
 
 def calculate_reliability(
-    frame_points,
-    window_start,
-    window_end,
-    measurements,
-    arm
+    samples,
+    measurement_names
 ):
-    """
-    Calculate reliability using the correct dependencies
-    for right- and left-arm bowlers.
-    """
 
-    relevant = frame_points[
-        max(
-            0,
-            window_start
-        ):
-        min(
-            len(frame_points),
-            window_end + 1
-        )
-    ]
-
-    if not relevant:
+    if not samples:
 
         return {
-            key: 0.0
-            for key in measurements
+            name: 0.0
+            for name in measurement_names
         }
 
-    if arm == "right":
-
-        bowling_shoulder = "right_shoulder"
-        bowling_elbow = "right_elbow"
-        bowling_wrist = "right_wrist"
-
-        front_hip = "left_hip"
-        front_knee = "left_knee"
-        front_ankle = "left_ankle"
-
-    else:
-
-        bowling_shoulder = "left_shoulder"
-        bowling_elbow = "left_elbow"
-        bowling_wrist = "left_wrist"
-
-        front_hip = "right_hip"
-        front_knee = "right_knee"
-        front_ankle = "right_ankle"
-
-    measurement_dependencies = {
+    dependencies = {
 
         "elbowAngle": [
-            bowling_shoulder,
-            bowling_elbow,
-            bowling_wrist
+            "right_shoulder",
+            "right_elbow",
+            "right_wrist"
         ],
 
         "frontKneeAngle": [
-            front_hip,
-            front_knee,
-            front_ankle
+            "left_hip",
+            "left_knee",
+            "left_ankle"
         ],
 
         "backKneeAngle": [
-            (
-                "right_hip"
-                if arm == "right"
-                else "left_hip"
-            ),
-            (
-                "right_knee"
-                if arm == "right"
-                else "left_knee"
-            ),
-            (
-                "right_ankle"
-                if arm == "right"
-                else "left_ankle"
-            )
+            "right_hip",
+            "right_knee",
+            "right_ankle"
         ],
 
         "trunkForwardFlexion": [
@@ -1706,8 +1160,8 @@ def calculate_reliability(
         ],
 
         "frontFootOffset": [
-            front_hip,
-            front_ankle
+            "left_hip",
+            "left_ankle"
         ],
 
         "headOffset": [
@@ -1729,24 +1183,35 @@ def calculate_reliability(
 
     reliability = {}
 
-    for (
-        measurement,
-        dependencies
-    ) in measurement_dependencies.items():
+    for measurement in measurement_names:
 
-        if measurement not in measurements:
+        required = dependencies.get(
+            measurement,
+            []
+        )
+
+        if not required:
+
+            reliability[
+                measurement
+            ] = 0.0
+
             continue
 
-        valid_frames = 0
+        valid = 0
 
-        for points in relevant:
+        for sample in samples:
 
-            if points is None:
+            points = sample.get(
+                "points"
+            )
+
+            if not points:
                 continue
 
             good = True
 
-            for name in dependencies:
+            for name in required:
 
                 value = points.get(
                     name
@@ -1756,35 +1221,21 @@ def calculate_reliability(
                     value is None
                     or
                     len(value) < 3
+                    or
+                    float(value[2]) < MIN_CONF
                 ):
 
                     good = False
                     break
 
-                try:
-
-                    confidence = float(
-                        value[2]
-                    )
-
-                except Exception:
-
-                    good = False
-                    break
-
-                if confidence < MIN_CONF:
-
-                    good = False
-                    break
-
             if good:
-                valid_frames += 1
+                valid += 1
 
         ratio = (
-            valid_frames
+            valid
             /
             max(
-                len(relevant),
+                len(samples),
                 1
             )
         )
@@ -1792,10 +1243,9 @@ def calculate_reliability(
         reliability[
             measurement
         ] = safe_float(
-            np.clip(
-                ratio,
-                0.0,
-                1.0
+            min(
+                1.0,
+                ratio
             )
         )
 
@@ -1803,7 +1253,7 @@ def calculate_reliability(
 
 
 # ============================================================
-# TECHNICAL SCORING
+# TECHNICAL REFERENCE RANGES
 # ============================================================
 
 REFERENCE_RANGES = {
@@ -1836,7 +1286,7 @@ REFERENCE_RANGES = {
     "frontFootOffset": (
         0.0,
         0.55
-    ),
+    )
 }
 
 
@@ -1852,9 +1302,13 @@ WEIGHTS = {
 
     "hipShoulderSeparation": 0.20,
 
-    "frontFootOffset": 0.20,
+    "frontFootOffset": 0.20
 }
 
+
+# ============================================================
+# SCORING
+# ============================================================
 
 def parameter_score(
     value,
@@ -1867,14 +1321,7 @@ def parameter_score(
 
     value = float(value)
 
-    if (
-        low
-        <=
-        value
-        <=
-        high
-    ):
-
+    if low <= value <= high:
         return 100.0
 
     span = max(
@@ -1883,26 +1330,15 @@ def parameter_score(
     )
 
     if value < low:
-
-        distance_from_range = (
-            low
-            -
-            value
-        )
-
+        deviation = low - value
     else:
-
-        distance_from_range = (
-            value
-            -
-            high
-        )
+        deviation = value - high
 
     score = (
         100.0
         -
         (
-            distance_from_range
+            deviation
             /
             span
         )
@@ -1929,10 +1365,7 @@ def calculate_scores(
     weighted_total = 0.0
     weight_total = 0.0
 
-    for (
-        name,
-        reference
-    ) in REFERENCE_RANGES.items():
+    for name, reference in REFERENCE_RANGES.items():
 
         value = measurements.get(
             name
@@ -1944,7 +1377,7 @@ def calculate_scores(
             reference[1]
         )
 
-        rel = reliability.get(
+        reliability_value = reliability.get(
             name,
             0.0
         )
@@ -1960,15 +1393,17 @@ def calculate_scores(
                 safe_float(score),
 
             "reliability":
-                safe_float(rel)
+                safe_float(
+                    reliability_value
+                )
         }
 
         if (
             score is not None
             and
-            rel is not None
+            reliability_value is not None
             and
-            rel > 0
+            reliability_value > 0
         ):
 
             weighted_total += (
@@ -1976,13 +1411,13 @@ def calculate_scores(
                 *
                 WEIGHTS[name]
                 *
-                rel
+                reliability_value
             )
 
             weight_total += (
                 WEIGHTS[name]
                 *
-                rel
+                reliability_value
             )
 
     if weight_total > 0:
@@ -2016,7 +1451,7 @@ def build_risks(
     risks = []
 
     # --------------------------------------------------------
-    # Lower back
+    # TRUNK
     # --------------------------------------------------------
 
     lateral = measurements.get(
@@ -2066,7 +1501,7 @@ def build_risks(
             })
 
     # --------------------------------------------------------
-    # Bowling elbow
+    # ELBOW
     # --------------------------------------------------------
 
     elbow = measurements.get(
@@ -2116,7 +1551,7 @@ def build_risks(
             })
 
     # --------------------------------------------------------
-    # Front knee
+    # FRONT KNEE
     # --------------------------------------------------------
 
     knee = measurements.get(
@@ -2148,7 +1583,7 @@ def build_risks(
         })
 
     # --------------------------------------------------------
-    # Front foot / ankle
+    # FRONT FOOT
     # --------------------------------------------------------
 
     foot = measurements.get(
@@ -2205,21 +1640,19 @@ def build_risks(
 # ============================================================
 
 def build_recommendations(
-    measurements,
     risks
 ):
 
     recommendations = []
 
-    risk_parameters = {
+    parameters = {
         item["parameter"]
         for item in risks
     }
 
     if (
         "trunkLateralFlexion"
-        in
-        risk_parameters
+        in parameters
     ):
 
         recommendations.append(
@@ -2228,8 +1661,7 @@ def build_recommendations(
 
     if (
         "elbowAngle"
-        in
-        risk_parameters
+        in parameters
     ):
 
         recommendations.append(
@@ -2238,8 +1670,7 @@ def build_recommendations(
 
     if (
         "frontKneeAngle"
-        in
-        risk_parameters
+        in parameters
     ):
 
         recommendations.append(
@@ -2248,8 +1679,7 @@ def build_recommendations(
 
     if (
         "frontFootOffset"
-        in
-        risk_parameters
+        in parameters
     ):
 
         recommendations.append(
@@ -2259,7 +1689,7 @@ def build_recommendations(
     if not recommendations:
 
         recommendations.append(
-            "No major biomechanical flags were identified in this delivery window."
+            "No major biomechanical flags were identified in the analyzed delivery window."
         )
 
         recommendations.append(
@@ -2270,179 +1700,54 @@ def build_recommendations(
 
 
 # ============================================================
-# DETECTION QUALITY
+# DETECTION RATE
 # ============================================================
 
 def calculate_detection_rate(
-    history
+    samples
 ):
 
-    if not history:
+    if not samples:
         return 0.0
 
     valid = sum(
         1
-        for item in history
-        if item is not None
+        for sample in samples
+        if sample.get("points") is not None
     )
 
     return safe_float(
         valid
         /
-        len(history)
+        len(samples)
     )
 
 
+# ============================================================
+# BODY SCALE
+# ============================================================
+
 def calculate_body_scale(
-    history
+    samples
 ):
 
-    scales = []
+    values = []
 
-    for points in history:
+    for sample in samples:
 
         scale = torso_length(
-            points
+            sample.get("points")
         )
 
-        if (
-            scale is not None
-            and
-            scale > 0
-        ):
+        if scale is not None and scale > 0:
+            values.append(scale)
 
-            scales.append(
-                scale
-            )
-
-    if not scales:
+    if not values:
         return None
 
     return safe_float(
-        median(scales)
+        median(values)
     )
-
-
-# ============================================================
-# EMPTY / LOW-CONFIDENCE REPORT
-# ============================================================
-
-def build_empty_report(
-    input_path,
-    arm,
-    fps,
-    frame_count,
-    width,
-    height,
-    processed_frames,
-    detection_rate,
-    reason
-):
-
-    return {
-
-        "status":
-            "ok",
-
-        "version":
-            VERSION,
-
-        "warning":
-            reason,
-
-        "video": {
-
-            "path":
-                os.path.normpath(
-                    input_path
-                ),
-
-            "fps":
-                safe_float(
-                    fps
-                ),
-
-            "frameCount":
-                int(
-                    frame_count
-                ),
-
-            "processedFrames":
-                int(
-                    processed_frames
-                ),
-
-            "frameSkip":
-                int(
-                    FRAME_SKIP
-                ),
-
-            "width":
-                int(
-                    width
-                ),
-
-            "height":
-                int(
-                    height
-                )
-        },
-
-        "bowlingArm":
-            arm,
-
-        "bodyScale": {
-
-            "medianTorsoPixels":
-                None
-        },
-
-        "releaseFrame": {
-
-            "index":
-                None,
-
-            "timestampSeconds":
-                None,
-
-            "percentThroughClip":
-                None,
-
-            "detectionMethod":
-                "unavailable"
-        },
-
-        "analysisWindow": {
-
-            "startFrame":
-                None,
-
-            "endFrame":
-                None,
-
-            "framesUsed":
-                0
-        },
-
-        "measurements": {},
-
-        "parameterScores": {},
-
-        "reliability": {},
-
-        "technicalScore":
-            None,
-
-        "riskIndicators": [],
-
-        "recommendations": [
-            "The video did not contain enough reliable pose detections for biomechanical scoring.",
-            "Try a clear side-on bowling video with the full body visible."
-        ],
-
-        "detectionRate":
-            detection_rate
-    }
 
 
 # ============================================================
@@ -2456,57 +1761,17 @@ def analyze_video(
     model_path="yolov8n-pose.pt"
 ):
 
-    arm = arm.lower()
-
-    if arm not in (
-        "right",
-        "left"
-    ):
-
-        raise ValueError(
-            "Arm must be 'right' or 'left'."
-        )
-
-    log()
-    log("=" * 60)
-    log("BOWLING BIOMECHANICS ANALYSIS SYSTEM")
-    log("PHASE 1 - AI ENGINE")
-    log("RENDER ROBUST LOW-MEMORY VERSION")
-    log("=" * 60)
-
-    log(
-        f"Python      : {sys.version.split()[0]}"
-    )
-
-    log(
-        f"OpenCV      : {cv2.__version__}"
-    )
-
-    log(
-        f"PyTorch     : {torch.__version__}"
-    )
-
-    log(
-        f"Ultralytics : {getattr(__import__('ultralytics'), '__version__', 'unknown')}"
-    )
-
-    log(
-        f"Input       : {input_path}"
-    )
-
-    log(
-        f"Arm         : {arm}"
-    )
-
-    log(
-        f"Model       : {model_path}"
-    )
+    print()
+    print("=" * 60)
+    print("CRIC AI - PHASE 1")
+    print("RENDER LIGHTWEIGHT BOWLING ANALYSIS")
+    print("=" * 60)
 
     # --------------------------------------------------------
-    # Validate input
+    # VALIDATION
     # --------------------------------------------------------
 
-    if not os.path.isfile(
+    if not os.path.exists(
         input_path
     ):
 
@@ -2514,7 +1779,7 @@ def analyze_video(
             f"Video not found: {input_path}"
         )
 
-    if not os.path.isfile(
+    if not os.path.exists(
         model_path
     ):
 
@@ -2522,26 +1787,12 @@ def analyze_video(
             f"YOLO model not found: {model_path}"
         )
 
-    # --------------------------------------------------------
-    # Load detector
-    # --------------------------------------------------------
+    print()
+    print("Input video:")
+    print(input_path)
 
-    detector = PoseDetector(
-        model_path
-    )
-
-    tracker = BowlingArmTracker(
-        arm=arm
-    )
-
-    # --------------------------------------------------------
-    # Open video
-    # --------------------------------------------------------
-
-    log()
-    log("=" * 60)
-    log("OPENING VIDEO")
-    log("=" * 60)
+    print()
+    print("Loading video metadata...")
 
     cap = cv2.VideoCapture(
         input_path
@@ -2557,12 +1808,7 @@ def analyze_video(
         cv2.CAP_PROP_FPS
     )
 
-    if (
-        not math.isfinite(fps)
-        or
-        fps <= 0
-    ):
-
+    if fps <= 0:
         fps = 30.0
 
     frame_count = int(
@@ -2584,415 +1830,331 @@ def analyze_video(
     )
 
     duration = (
-        frame_count / fps
+        frame_count
+        /
+        fps
         if fps > 0
         else 0
     )
 
-    log(
-        f"FPS              : {fps:.2f}"
+    print()
+    print("VIDEO")
+    print("-" * 60)
+    print(
+        f"FPS          : {fps:.2f}"
     )
-
-    log(
-        f"Frames           : {frame_count}"
+    print(
+        f"Frames       : {frame_count}"
     )
-
-    log(
-        f"Resolution       : {width} x {height}"
+    print(
+        f"Resolution   : {width} x {height}"
     )
-
-    log(
-        f"Duration         : {duration:.2f}s"
-    )
-
-    log(
-        f"Frame skip       : {FRAME_SKIP}"
-    )
-
-    log(
-        f"YOLO image size  : {YOLO_IMAGE_SIZE}"
-    )
-
-    log(
-        f"Max frame dim    : {MAX_FRAME_DIMENSION}px"
-    )
-
-    log(
-        f"Max analysis     : {MAX_ANALYSIS_FRAMES} processed frames"
+    print(
+        f"Duration     : {duration:.2f}s"
     )
 
     # --------------------------------------------------------
-    # Process frames
+    # SELECT FRAMES
     # --------------------------------------------------------
 
-    history = []
-    measurements_history = []
+    selected_indices = select_frame_indices(
+        frame_count
+    )
 
-    frame_index = 0
-    processed_frames = 0
-    last_progress = -1
+    print()
+    print("LIGHTWEIGHT SAMPLING")
+    print("-" * 60)
+    print(
+        f"Selected frames : {len(selected_indices)}"
+    )
+    print(
+        f"Maximum YOLO    : {MAX_INFERENCES}"
+    )
+    print(
+        f"YOLO size       : {YOLO_IMAGE_SIZE}"
+    )
+    print(
+        f"Frame dimension : {MAX_FRAME_DIMENSION}px"
+    )
 
-    try:
-
-        while True:
-
-            success, frame = cap.read()
-
-            if not success:
-                break
-
-            frame_index += 1
-
-            # ------------------------------------------------
-            # Skip frames
-            # ------------------------------------------------
-
-            if (
-                frame_index % FRAME_SKIP
-                != 0
-            ):
-
-                continue
-
-            # ------------------------------------------------
-            # Safety limit
-            # ------------------------------------------------
-
-            if (
-                MAX_ANALYSIS_FRAMES is not None
-                and
-                processed_frames
-                >=
-                MAX_ANALYSIS_FRAMES
-            ):
-
-                log()
-                log(
-                    f"[INFO] Reached maximum analysis limit "
-                    f"of {MAX_ANALYSIS_FRAMES} processed frames."
-                )
-
-                break
-
-            # ------------------------------------------------
-            # Resize
-            # ------------------------------------------------
-
-            frame = resize_for_inference(
-                frame
-            )
-
-            # ------------------------------------------------
-            # YOLO detection
-            # ------------------------------------------------
-
-            points = detector.detect(
-                frame
-            )
-
-            # ------------------------------------------------
-            # Temporal tracking
-            # ------------------------------------------------
-
-            if points is not None:
-
-                points = tracker.update(
-                    points
-                )
-
-            history.append(
-                points
-            )
-
-            measurements_history.append(
-                calculate_measurements(
-                    points,
-                    arm
-                )
-            )
-
-            processed_frames += 1
-
-            # ------------------------------------------------
-            # Progress
-            # ------------------------------------------------
-
-            if frame_count > 0:
-
-                percentage = (
-                    frame_index
-                    /
-                    frame_count
-                ) * 100
-
-                progress_bucket = int(
-                    percentage
-                    /
-                    10
-                )
-
-                if (
-                    progress_bucket
-                    >
-                    last_progress
-                ):
-
-                    last_progress = (
-                        progress_bucket
-                    )
-
-                    log(
-                        f"Processing: "
-                        f"{percentage:.1f}% "
-                        f"| processed={processed_frames} "
-                        f"| detections={sum(1 for x in history if x is not None)}"
-                    )
-
-            # ------------------------------------------------
-            # Cleanup
-            # ------------------------------------------------
-
-            del frame
-
-    finally:
+    if not selected_indices:
 
         cap.release()
 
+        raise RuntimeError(
+            "Video contains no readable frames."
+        )
+
     # --------------------------------------------------------
-    # Cleanup after video processing
+    # LOAD MODEL ONLY AFTER VIDEO VALIDATION
     # --------------------------------------------------------
+
+    detector = PoseDetector(
+        model_path
+    )
+
+    # --------------------------------------------------------
+    # PROCESS SELECTED FRAMES
+    # --------------------------------------------------------
+
+    samples = []
+
+    selected_set = set(
+        selected_indices
+    )
+
+    next_position = 0
+
+    current_frame = 0
+
+    inference_count = 0
+
+    print()
+    print("STARTING LIMITED YOLO INFERENCE")
+    print("-" * 60)
+
+    while (
+        current_frame < frame_count
+        and
+        inference_count < MAX_INFERENCES
+    ):
+
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        if current_frame not in selected_set:
+
+            current_frame += 1
+            continue
+
+        # ----------------------------------------------------
+        # Resize immediately.
+        # ----------------------------------------------------
+
+        frame = resize_for_inference(
+            frame
+        )
+
+        # ----------------------------------------------------
+        # YOLO
+        # ----------------------------------------------------
+
+        points = detector.detect(
+            frame
+        )
+
+        inference_count += 1
+
+        timestamp = (
+            current_frame
+            /
+            fps
+            if fps > 0
+            else 0
+        )
+
+        samples.append({
+
+            "frameIndex":
+                int(current_frame),
+
+            "timestamp":
+                safe_float(timestamp),
+
+            "points":
+                points
+        })
+
+        # ----------------------------------------------------
+        # Release frame immediately.
+        # ----------------------------------------------------
+
+        del frame
+
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
+
+        print(
+            f"Inference "
+            f"{inference_count}/"
+            f"{len(selected_indices)} "
+            f"| frame "
+            f"{current_frame}"
+        )
+
+        current_frame += 1
+
+    cap.release()
+
+    # --------------------------------------------------------
+    # FREE MODEL CACHE
+    # --------------------------------------------------------
+
+    try:
+
+        if hasattr(
+            detector,
+            "model"
+        ):
+
+            del detector.model
+
+    except Exception:
+        pass
+
+    del detector
 
     gc.collect()
 
+    # --------------------------------------------------------
+    # DETECTION RATE
+    # --------------------------------------------------------
+
     detection_rate = calculate_detection_rate(
-        history
+        samples
     )
 
-    detected_frames = sum(
-        1
-        for item in history
-        if item is not None
+    valid_samples = [
+        sample
+        for sample in samples
+        if sample.get("points") is not None
+    ]
+
+    print()
+    print(
+        f"YOLO inferences : {inference_count}"
     )
 
-    log()
-    log("=" * 60)
-    log("POSE PROCESSING COMPLETE")
-    log("=" * 60)
-
-    log(
-        f"Frames read       : {frame_index}"
+    print(
+        f"Valid detections: {len(valid_samples)}"
     )
 
-    log(
-        f"Frames analyzed   : {processed_frames}"
-    )
-
-    log(
-        f"Frames detected   : {detected_frames}"
-    )
-
-    log(
-        f"Detection rate    : {detection_rate * 100:.1f}%"
+    print(
+        f"Detection rate  : "
+        f"{detection_rate * 100:.1f}%"
     )
 
     # --------------------------------------------------------
-    # Not enough frames
+    # FALLBACK WHEN DETECTION IS TOO LOW
     # --------------------------------------------------------
 
-    if (
-        len(history)
-        <
-        MIN_ANALYSIS_FRAMES
-    ):
+    if not valid_samples:
 
-        reason = (
-            "Not enough video frames were available for "
-            "Phase 1 biomechanical analysis."
+        raise RuntimeError(
+            "YOLO could not detect a reliable person "
+            "in the selected frames."
         )
 
-        report = build_empty_report(
-            input_path,
-            arm,
-            fps,
-            frame_count,
-            width,
-            height,
-            processed_frames,
-            detection_rate,
-            reason
-        )
-
-        if output_path is None:
-
-            base, _ = os.path.splitext(
-                input_path
-            )
-
-            output_path = (
-                base
-                +
-                "_phase1_result.json"
-            )
-
-        with open(
-            output_path,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                report,
-                file,
-                indent=2,
-                ensure_ascii=False
-            )
-
-        log()
-        log(
-            f"JSON report: {output_path}"
-        )
-
-        return report
-
     # --------------------------------------------------------
-    # Release detection
+    # RELEASE
     # --------------------------------------------------------
 
-    log()
-    log("=" * 60)
-    log("RELEASE DETECTION")
-    log("=" * 60)
-
-    release_frame = detect_release(
-        history,
+    release_sample_index = estimate_release(
+        samples,
         arm
     )
 
-    if release_frame is None:
+    if release_sample_index is None:
 
-        release_frame = int(
-            len(history)
-            *
-            0.70
+        # Use a late-video fallback.
+        release_sample_index = max(
+            0,
+            int(
+                len(samples) * 0.70
+            )
         )
 
-        release_detection_method = (
-            "fallback"
-        )
-
-        log(
-            "Release peak not confidently detected."
-        )
-
-        log(
-            "Using 70% clip-position fallback."
-        )
+        release_method = "fallback"
 
     else:
 
-        release_detection_method = (
-            "wrist_speed_peak"
+        release_method = (
+            "sampled_wrist_speed_peak"
         )
 
-        log(
-            f"Wrist-speed release candidate: "
-            f"processed frame {release_frame}"
-        )
-
-    release_frame = int(
+    release_sample_index = int(
         np.clip(
-            release_frame,
+            release_sample_index,
             0,
             max(
-                len(history) - 1,
+                len(samples) - 1,
                 0
             )
         )
     )
 
-    # --------------------------------------------------------
-    # Convert processed-frame index to original frame index
-    # --------------------------------------------------------
+    release_sample = samples[
+        release_sample_index
+    ]
 
-    release_original_frame = (
-        release_frame
-        *
-        FRAME_SKIP
-    )
-
-    release_timestamp = (
-        release_original_frame
-        /
-        fps
-    )
-
-    release_percent = (
-        release_original_frame
-        /
-        max(
-            frame_count - 1,
-            1
-        )
-    ) * 100
-
-    log(
-        f"Release original frame : "
-        f"{release_original_frame}"
-    )
-
-    log(
-        f"Release timestamp      : "
-        f"{release_timestamp:.3f}s"
-    )
-
-    log(
-        f"Release clip position  : "
-        f"{release_percent:.1f}%"
-    )
-
-    # --------------------------------------------------------
-    # Delivery window
-    # --------------------------------------------------------
-
-    start_frame = max(
-        0,
-        release_frame
-        -
-        WINDOW_BEFORE
-    )
-
-    end_frame = min(
-        len(history) - 1,
-        release_frame
-        +
-        WINDOW_AFTER
-    )
-
-    window_measurements = (
-        measurements_history[
-            start_frame:
-            end_frame + 1
+    release_original_frame = int(
+        release_sample[
+            "frameIndex"
         ]
     )
 
-    measurements = aggregate_measurements(
-        window_measurements
+    release_timestamp = float(
+        release_sample[
+            "timestamp"
+        ]
     )
 
     # --------------------------------------------------------
-    # Reliability
+    # MEASUREMENT WINDOW
+    # --------------------------------------------------------
+
+    window_start = max(
+        0,
+        release_sample_index
+        -
+        MEASUREMENT_WINDOW
+    )
+
+    window_end = min(
+        len(samples) - 1,
+        release_sample_index
+        +
+        MEASUREMENT_WINDOW
+    )
+
+    window_samples = samples[
+        window_start:
+        window_end + 1
+    ]
+
+    # --------------------------------------------------------
+    # MEASUREMENTS
+    # --------------------------------------------------------
+
+    measurement_history = []
+
+    for sample in window_samples:
+
+        measurement_history.append(
+            calculate_measurements(
+                sample.get("points"),
+                arm
+            )
+        )
+
+    measurements = aggregate_measurements(
+        measurement_history
+    )
+
+    # --------------------------------------------------------
+    # RELIABILITY
     # --------------------------------------------------------
 
     reliability = calculate_reliability(
-        history,
-        start_frame,
-        end_frame,
-        measurements,
-        arm
+        window_samples,
+        measurements.keys()
     )
 
     # --------------------------------------------------------
-    # Technical scores
+    # TECHNICAL SCORE
     # --------------------------------------------------------
 
     (
@@ -3004,7 +2166,7 @@ def analyze_video(
     )
 
     # --------------------------------------------------------
-    # Risks
+    # RISKS
     # --------------------------------------------------------
 
     risks = build_risks(
@@ -3012,40 +2174,23 @@ def analyze_video(
     )
 
     # --------------------------------------------------------
-    # Recommendations
+    # RECOMMENDATIONS
     # --------------------------------------------------------
 
     recommendations = build_recommendations(
-        measurements,
         risks
     )
 
     # --------------------------------------------------------
-    # Body scale
+    # BODY SCALE
     # --------------------------------------------------------
 
     body_scale = calculate_body_scale(
-        history
+        samples
     )
 
     # --------------------------------------------------------
-    # Analysis window original frame numbers
-    # --------------------------------------------------------
-
-    start_original_frame = (
-        start_frame
-        *
-        FRAME_SKIP
-    )
-
-    end_original_frame = (
-        end_frame
-        *
-        FRAME_SKIP
-    )
-
-    # --------------------------------------------------------
-    # Final report
+    # REPORT
     # --------------------------------------------------------
 
     report = {
@@ -3056,6 +2201,24 @@ def analyze_video(
         "version":
             VERSION,
 
+        "engine": {
+
+            "architecture":
+                "sampled-pose",
+
+            "renderOptimized":
+                True,
+
+            "maxInferences":
+                MAX_INFERENCES,
+
+            "yoloImageSize":
+                YOLO_IMAGE_SIZE,
+
+            "maxFrameDimension":
+                MAX_FRAME_DIMENSION
+        },
+
         "video": {
 
             "path":
@@ -3064,34 +2227,27 @@ def analyze_video(
                 ),
 
             "fps":
-                safe_float(
-                    fps
-                ),
+                safe_float(fps),
 
             "frameCount":
-                int(
-                    frame_count
-                ),
+                int(frame_count),
 
             "processedFrames":
-                int(
-                    processed_frames
-                ),
+                int(inference_count),
 
-            "frameSkip":
+            "sampledFrames":
                 int(
-                    FRAME_SKIP
+                    len(selected_indices)
                 ),
 
             "width":
-                int(
-                    width
-                ),
+                int(width),
 
             "height":
-                int(
-                    height
-                )
+                int(height),
+
+            "durationSeconds":
+                safe_float(duration)
         },
 
         "bowlingArm":
@@ -3105,8 +2261,6 @@ def analyze_video(
 
         "releaseFrame": {
 
-            # Keep "index" for compatibility.
-            # This now represents the original video frame.
             "index":
                 int(
                     release_original_frame
@@ -3119,32 +2273,46 @@ def analyze_video(
 
             "percentThroughClip":
                 safe_float(
-                    release_percent
+                    (
+                        release_original_frame
+                        /
+                        max(
+                            frame_count - 1,
+                            1
+                        )
+                    )
+                    *
+                    100
+                ),
+
+            "sampleIndex":
+                int(
+                    release_sample_index
                 ),
 
             "detectionMethod":
-                release_detection_method
+                release_method
         },
 
         "analysisWindow": {
 
             "startFrame":
                 int(
-                    start_original_frame
+                    window_samples[0][
+                        "frameIndex"
+                    ]
                 ),
 
             "endFrame":
                 int(
-                    end_original_frame
+                    window_samples[-1][
+                        "frameIndex"
+                    ]
                 ),
 
             "framesUsed":
                 int(
-                    end_frame
-                    -
-                    start_frame
-                    +
-                    1
+                    len(window_samples)
                 )
         },
 
@@ -3171,7 +2339,7 @@ def analyze_video(
     }
 
     # --------------------------------------------------------
-    # Output path
+    # OUTPUT PATH
     # --------------------------------------------------------
 
     if output_path is None:
@@ -3211,73 +2379,65 @@ def analyze_video(
         )
 
     # --------------------------------------------------------
-    # Console summary
+    # CONSOLE SUMMARY
     # --------------------------------------------------------
 
-    log()
-    log("=" * 60)
-    log("PHASE 1 ANALYSIS COMPLETE")
-    log("=" * 60)
+    print()
+    print("=" * 60)
+    print("PHASE 1 ANALYSIS COMPLETE")
+    print("=" * 60)
 
-    log()
-
-    log(
+    print()
+    print(
         f"Technical score : "
-        f"{technical_score if technical_score is not None else '--'}"
+        f"{technical_score "
+        if technical_score is not None "
+        else '--'}"
     )
 
-    log(
+    print(
         f"Release frame   : "
         f"{release_original_frame}"
     )
 
-    log(
+    print(
         f"Release time    : "
         f"{release_timestamp:.3f}s"
     )
 
-    log(
+    print(
+        f"YOLO inferences : "
+        f"{inference_count}"
+    )
+
+    print(
         f"Detection rate  : "
         f"{detection_rate * 100:.1f}%"
     )
 
-    log(
+    print(
         f"Risk indicators : "
         f"{len(risks)}"
     )
 
-    log()
-
-    log("MEASUREMENTS")
-    log("-" * 60)
+    print()
+    print("MEASUREMENTS")
+    print("-" * 60)
 
     for name, value in measurements.items():
 
-        log(
+        print(
             f"{name:<30}: "
             f"{value if value is not None else '--'}"
         )
 
-    log()
-
-    log("RELIABILITY")
-    log("-" * 60)
-
-    for name, value in reliability.items():
-
-        log(
-            f"{name:<30}: "
-            f"{value if value is not None else '--'}"
-        )
-
-    log()
-
-    log("RISK INDICATORS")
-    log("-" * 60)
+    print()
+    print("RISK INDICATORS")
+    print("-" * 60)
 
     if not risks:
 
-        log(
+        print(
             "No major biomechanical risk indicators."
         )
 
@@ -3285,32 +2445,31 @@ def analyze_video(
 
         for risk in risks:
 
-            log(
+            print(
                 f"[{risk['severity'].upper()}] "
                 f"{risk['bodyArea']}: "
                 f"{risk['message']}"
             )
 
-    log()
-
-    log("RECOMMENDATIONS")
-    log("-" * 60)
+    print()
+    print("RECOMMENDATIONS")
+    print("-" * 60)
 
     for recommendation in recommendations:
 
-        log(
+        print(
             f"- {recommendation}"
         )
 
-    log()
+    print()
+    print("=" * 60)
 
-    log("=" * 60)
-
-    log(
-        f"JSON report: {output_path}"
+    print(
+        f"JSON report: "
+        f"{output_path}"
     )
 
-    log("=" * 60)
+    print("=" * 60)
 
     gc.collect()
 
@@ -3325,8 +2484,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Bowling Biomechanics "
-            "Analysis System - Phase 1"
+            "Cric AI - Render Lightweight "
+            "Bowling Biomechanics Phase 1"
         )
     )
 
@@ -3354,7 +2513,7 @@ def main():
     parser.add_argument(
         "--model",
         default="yolov8n-pose.pt",
-        help="YOLO pose model"
+        help="YOLO pose model path"
     )
 
     args = parser.parse_args()
@@ -3370,42 +2529,26 @@ def main():
 
     except KeyboardInterrupt:
 
-        log()
-        log(
+        print()
+        print(
             "Analysis cancelled."
         )
 
-        sys.exit(130)
-
     except Exception as error:
 
-        log()
-        log("=" * 60)
-        log("PHASE 1 ERROR")
-        log("=" * 60)
+        print()
+        print("=" * 60)
+        print("PHASE 1 ERROR")
+        print("=" * 60)
 
-        log(
-            f"Error type : {type(error).__name__}"
+        print(
+            str(error)
         )
 
-        log(
-            f"Error      : {error}"
-        )
+        print("=" * 60)
 
-        log()
-        log("TRACEBACK")
-        log("-" * 60)
+        raise
 
-        traceback.print_exc()
-
-        log("=" * 60)
-
-        sys.exit(1)
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
